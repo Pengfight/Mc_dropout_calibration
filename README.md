@@ -1,4 +1,4 @@
-# A baseline for MC_dropout_calibration
+# A baseline for MC_dropout calibration
 ### Training Lenet model for CIFAR-10
 running: python train.py 
 ### Then get calibrated model using post-processing method([temperature scaling](https://github.com/gpleiss/temperature_scaling)) 
