@@ -28,13 +28,13 @@ def demo(data, save, depth=40, growth_rate=40, batch_size=256):
     save (str) - directory with necessary files (see above)
     """
     # Load model state dict
-    model_filename = os.path.join(save, 'model_100.pth')
+    model_filename = os.path.join(save, 'model.pth')
     if not os.path.exists(model_filename):
         raise RuntimeError('Cannot find file %s to load' % model_filename)
     state_dict = torch.load(model_filename)
 
     # Load validation indices
-    valid_indices_filename = os.path.join(save, 'valid_indices_100.pth')
+    valid_indices_filename = os.path.join(save, 'valid_indices.pth')
     if not os.path.exists(valid_indices_filename):
         raise RuntimeError('Cannot find file %s to load' % valid_indices_filename)
     valid_indices = torch.load(valid_indices_filename)
