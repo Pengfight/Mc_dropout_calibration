@@ -1,254 +1,366 @@
-"""
-Training script adapted from demo in
-https://github.com/gpleiss/efficient_densenet_pytorch
-"""
-
-import fire
+import argparse
 import os
 import time
+import shutil
+
 import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import torch.backends.cudnn as cudnn
+
+
 import torchvision as tv
-from torch import nn, optim
 from torch.utils.data.sampler import SubsetRandomSampler
-from models import DenseNet
+import torchvision.transforms as transforms
+
+from models import *
 
 
-class Meter():
-    """
-    A little helper class which keeps track of statistics during an epoch.
-    """
-    def __init__(self, name, cum=False):
-        """
-        name (str or iterable): name of values for the meter
-            If an iterable of size n, updates require a n-Tensor
-        cum (bool): is this meter for a cumulative value (e.g. time)
-            or for an averaged value (e.g. loss)? - default False
-        """
-        self.cum = cum
-        if type(name) == str:
-            name = (name,)
-        self.name = name
+parser = argparse.ArgumentParser(description='PyTorch Cifar100 Training')
+parser.add_argument('--epochs', default=200, type=int, metavar='N', help='number of total epochs to run')
+parser.add_argument('--start-epoch', default=0, type=int, metavar='N', help='manual epoch number (useful on restarts)')
+parser.add_argument('-b', '--batch-size', default=128, type=int, metavar='N', help='mini-batch size (default: 128),only used for train')
+parser.add_argument('--lr', '--learning-rate', default=0.1, type=float, metavar='LR', help='initial learning rate')
+parser.add_argument('--momentum', default=0.9, type=float, metavar='M', help='momentum')
+parser.add_argument('--weight-decay', '--wd', default=1e-4, type=float, metavar='W', help='weight decay (default: 1e-4)')
+parser.add_argument('--print-freq', '-p', default=10, type=int, metavar='N', help='print frequency (default: 10)')
+parser.add_argument('--resume', default='', type=str, metavar='PATH', help='path to latest checkpoint (default: none)')
+parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true', help='evaluate model on validation set')
+parser.add_argument('-ct', '--cifar-type', default='100', type=int, metavar='CT', help='10 for cifar10,100 for cifar100 (default: 10)')
 
-        self._total = torch.zeros(len(self.name))
-        self._last_value = torch.zeros(len(self.name))
-        self._count = 0.0
+best_prec = 0
 
-    def update(self, data, n=1):
-        """
-        Update the meter
-        data (Tensor, or float): update value for the meter
-            Size of data should match size of ``name'' in the initialized args
-        """
-        self._count = self._count + n
-        if torch.is_tensor(data):
-            self._last_value.copy_(data)
+def main():
+    global args, best_prec
+    args = parser.parse_args()
+    use_gpu = torch.cuda.is_available()
+
+    # Model building
+    print('=> Building model...')
+    if use_gpu:
+        # model can be set to anyone that I have defined in models folder
+        # note the model should match to the cifar type !
+
+        #model = resnet20_cifar()
+        # model = resnet32_cifar()
+        # model = resnet44_cifar()
+        # model = resnet110_cifar()
+        # model = preact_resnet110_cifar()
+        # model = resnet164_cifar(num_classes=100)
+        # model = resnet1001_cifar(num_classes=100)
+        # model = preact_resnet164_cifar(num_classes=100)
+        # model = preact_resnet1001_cifar(num_classes=100)
+
+        # model = wide_resnet_cifar(depth=26, width=10, num_classes=100)
+
+        # model = resneXt_cifar(depth=29, cardinality=16, baseWidth=64, num_classes=100)
+        
+        model = densenet_BC_cifar(depth=100, k=40, num_classes=100)
+
+        # mkdir a new folder to store the checkpoint and best model
+        if not os.path.exists('result'):
+            os.makedirs('result')
+        fdir = 'result/resnet20_cifar10'
+        if not os.path.exists(fdir):
+            os.makedirs(fdir)
+
+        # adjust the lr according to the model type
+        if isinstance(model, (ResNet_Cifar, PreAct_ResNet_Cifar)):
+            model_type = 1
+        elif isinstance(model, Wide_ResNet_Cifar):
+            model_type = 2
+        elif isinstance(model, (ResNeXt_Cifar, DenseNet_Cifar)):
+            model_type = 3
         else:
-            self._last_value.fill_(data)
-        self._total.add_(self._last_value)
+            print('model type unrecognized...')
+            return
 
-    def value(self):
-        """
-        Returns the value of the meter
-        """
-        if self.cum:
-            return self._total
-        else:
-            return self._total / self._count
-
-    def __repr__(self):
-        return '\t'.join(['%s: %.5f (%.3f)' % (n, lv, v)
-            for n, lv, v in zip(self.name, self._last_value, self.value())])
-
-
-def run_epoch(loader, model, criterion, optimizer, epoch=0, n_epochs=0, train=True):
-    time_meter = Meter(name='Time', cum=True)
-    loss_meter = Meter(name='Loss', cum=False)
-    error_meter = Meter(name='Error', cum=False)
-
-    if train:
-        model.train()
-        print('Training')
+        model = nn.DataParallel(model).cuda()
+        criterion = nn.CrossEntropyLoss().cuda()
+        optimizer = optim.SGD(model.parameters(), args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+        cudnn.benchmark = True
     else:
-        model.eval()
-        print('Evaluating')
+        print('Cuda is not available!')
+        return
+
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print('=> loading checkpoint "{}"'.format(args.resume))
+            checkpoint = torch.load(args.resume)
+            args.start_epoch = checkpoint['epoch']
+            best_prec = checkpoint['best_prec']
+            model.load_state_dict(checkpoint['state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            print("=> loaded checkpoint '{}' (epoch {})".format(args.resume, checkpoint['epoch']))
+        else:
+            print("=> no checkpoint found at '{}'".format(args.resume))
+
+    # Data loading and preprocessing
+    # CIFAR10
+    if args.cifar_type == 10:
+        print('=> loading cifar10 data...')
+        normalize = transforms.Normalize(mean=[0.491, 0.482, 0.447], std=[0.247, 0.243, 0.262])
+
+        train_dataset = torchvision.datasets.CIFAR10(
+            root='./data', 
+            train=True, 
+            download=True,
+            transform=transforms.Compose([
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                normalize,
+            ]))
+        trainloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
+
+        test_dataset = torchvision.datasets.CIFAR10(
+            root='./data',
+            train=False,
+            download=True,
+            transform=transforms.Compose([
+                transforms.ToTensor(),
+                normalize,
+            ]))
+        testloader = torch.utils.data.DataLoader(test_dataset, batch_size=100, shuffle=False, num_workers=2)
+    # CIFAR100
+    else:
+        # Data transforms
+        valid_size=5000
+        mean = [0.5071, 0.4867, 0.4408]
+        stdv = [0.2675, 0.2565, 0.2761]
+        train_transforms = tv.transforms.Compose([
+            tv.transforms.RandomCrop(32, padding=4),
+            tv.transforms.RandomHorizontalFlip(),
+            tv.transforms.ToTensor(),
+            tv.transforms.Normalize(mean=mean, std=stdv),
+        ])
+        test_transforms = tv.transforms.Compose([
+            tv.transforms.ToTensor(),
+            tv.transforms.Normalize(mean=mean, std=stdv),
+        ])
+
+        # Split training into train and validation - needed for calibration
+        #
+        # IMPORTANT! We need to use the same validation set for temperature
+        # scaling, so we're going to save the indices for later
+        train_set = tv.datasets.CIFAR100('./data', train=True, transform=train_transforms, download=True)
+        valid_set = tv.datasets.CIFAR100('./data', train=True, transform=test_transforms, download=False)
+        indices = torch.randperm(len(train_set))
+        train_indices = indices[:len(indices) - valid_size]
+        valid_indices = indices[len(indices) - valid_size:] if valid_size else None
+
+        # Make dataloaders
+        trainloader = torch.utils.data.DataLoader(train_set, pin_memory=True, batch_size=args.batch_size,
+                                                sampler=SubsetRandomSampler(train_indices))
+        testloader = torch.utils.data.DataLoader(valid_set, pin_memory=True, batch_size=100,
+                                                sampler=SubsetRandomSampler(valid_indices))
+        """ print('=> loading cifar100 data...')
+        normalize = transforms.Normalize(mean=[0.507, 0.487, 0.441], std=[0.267, 0.256, 0.276])
+
+        train_dataset = torchvision.datasets.CIFAR100(
+            root='./data',
+            train=True,
+            download=True,
+            transform=transforms.Compose([
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                normalize,
+            ]))
+        trainloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
+
+        test_dataset = torchvision.datasets.CIFAR100(
+            root='./data',
+            train=False,
+            download=True,
+            transform=transforms.Compose([
+                transforms.ToTensor(),
+                normalize,
+            ]))
+        testloader = torch.utils.data.DataLoader(test_dataset, batch_size=100, shuffle=False, num_workers=2) """
+
+    if args.evaluate:
+        validate(testloader, model, criterion)
+        return
+
+    for epoch in range(args.start_epoch, args.epochs):
+        adjust_learning_rate(optimizer, epoch, model_type)
+
+        # train for one epoch
+        train(trainloader, model, criterion, optimizer, epoch)
+
+        # evaluate on test set
+        prec = validate(testloader, model, criterion)
+
+        # remember best precision and save checkpoint
+        is_best = prec > best_prec
+        best_prec = max(prec,best_prec)
+        save_checkpoint({
+            'epoch': epoch + 1,
+            'state_dict': model.state_dict(),
+            'best_prec': best_prec,
+            'optimizer': optimizer.state_dict(),
+        }, is_best, fdir)
+        if epoch == args.epochs -1:
+            torch.save(model.state_dict(), os.path.join('model', 'model_100.pth'))
+            torch.save(valid_indices, os.path.join('model', 'valid_indices_100.pth'))
+    """ torch.save(model.state_dict(), os.path.join('model', 'model.pth'))
+    torch.save(valid_indices, os.path.join('model', 'valid_indices.pth')) """
+
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+
+def train(trainloader, model, criterion, optimizer, epoch):
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+
+    model.train()
 
     end = time.time()
-    for i, (input, target) in enumerate(loader):
-        if train:
-            model.zero_grad()
-            optimizer.zero_grad()
+    for i, (input, target) in enumerate(trainloader):
+        # measure data loading time
+        data_time.update(time.time() - end)
 
-            # Forward pass
-            input = input.cuda()
-            target = target.cuda()
+        input, target = input.cuda(), target.cuda()
+
+        # compute output
+        output = model(input)
+        loss = criterion(output, target)
+
+        # measure accuracy and record loss
+        prec = accuracy(output, target)[0]
+        losses.update(loss.item(), input.size(0))
+        top1.update(prec.item(), input.size(0))
+
+        # compute gradient and do SGD step
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if i % args.print_freq == 0:
+            print('Epoch: [{0}][{1}/{2}]\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'Prec {top1.val:.3f}% ({top1.avg:.3f}%)'.format(
+                   epoch, i, len(trainloader), batch_time=batch_time,
+                   data_time=data_time, loss=losses, top1=top1))
+
+
+def validate(val_loader, model, criterion):
+    batch_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+
+    # switch to evaluate mode
+    model.eval()
+
+    end = time.time()
+    with torch.no_grad():
+        for i, (input, target) in enumerate(val_loader):
+            input, target = input.cuda(), target.cuda()
+
+            # compute output
             output = model(input)
             loss = criterion(output, target)
 
-            # Backward pass
-            loss.backward()
-            optimizer.step()
-            optimizer.n_iters = optimizer.n_iters + 1 if hasattr(optimizer, 'n_iters') else 1
+            # measure accuracy and record loss
+            prec = accuracy(output, target)[0]
+            losses.update(loss.item(), input.size(0))
+            top1.update(prec.item(), input.size(0))
 
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if i % args.print_freq == 0:
+                print('Test: [{0}/{1}]\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'Prec {top1.val:.3f}% ({top1.avg:.3f}%)'.format(
+                   i, len(val_loader), batch_time=batch_time, loss=losses,
+                   top1=top1))
+
+    print(' * Prec {top1.avg:.3f}% '.format(top1=top1))
+
+    return top1.avg
+
+
+def save_checkpoint(state, is_best, fdir):
+    filepath = os.path.join(fdir, 'checkpoint.pth')
+    torch.save(state, filepath)
+    if is_best:
+        shutil.copyfile(filepath, os.path.join(fdir, 'model_best.pth.tar'))
+
+
+def adjust_learning_rate(optimizer, epoch, model_type):
+    """For resnet, the lr starts from 0.1, and is divided by 10 at 80 and 120 epochs"""
+    if model_type == 1:
+        if epoch < 80:
+            lr = args.lr
+        elif epoch < 120:
+            lr = args.lr * 0.1
         else:
-            with torch.no_grad():
-                # Forward pass
-                input = input.cuda()
-                target = target.cuda()
-                output = model(input)
-                loss = criterion(output, target)
-
-        # Accounting
-        _, predictions = torch.topk(output, 1)
-        error = 1 - torch.eq(predictions, target).float().mean()
-        batch_time = time.time() - end
-        end = time.time()
-
-        # Log errors
-        time_meter.update(batch_time)
-        loss_meter.update(loss)
-        error_meter.update(error)
-        print('  '.join([
-            '%s: (Epoch %d of %d) [%04d/%04d]' % ('Train' if train else 'Eval',
-                epoch, n_epochs, i + 1, len(loader)),
-            str(time_meter),
-            str(loss_meter),
-            str(error_meter),
-        ]))
-
-    return time_meter.value(), loss_meter.value(), error_meter.value()
+            lr = args.lr * 0.01
+    elif model_type == 2:
+        if epoch < 60:
+            lr = args.lr
+        elif epoch < 120:
+            lr = args.lr * 0.2
+        elif epoch < 160:
+            lr = args.lr * 0.04
+        else:
+            lr = args.lr * 0.008
+    elif model_type == 3:
+        if epoch < 150:
+            lr = args.lr
+        elif epoch < 225:
+            lr = args.lr * 0.1
+        else:
+            lr = args.lr * 0.01
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
 
 
-def train(data, save, valid_size=5000, seed=None,
-          depth=40, growth_rate=12, n_epochs=300, batch_size=64,
-          lr=0.1, wd=0.0001, momentum=0.9):
-    """
-    A function to train a DenseNet-BC on CIFAR-100.
+def accuracy(output, target, topk=(1,)):
+    """Computes the precision@k for the specified values of k"""
+    maxk = max(topk)
+    batch_size = target.size(0)
 
-    Args:
-        data (str) - path to directory where data should be loaded from/downloaded
-            (default $DATA_DIR)
-        save (str) - path to save the model to (default /tmp)
+    _, pred = output.topk(maxk, 1, True, True)
+    pred = pred.t()
+    correct = pred.eq(target.view(1, -1).expand_as(pred))
 
-        valid_size (int) - size of validation set
-        seed (int) - manually set the random seed (default None)
-
-        depth (int) - depth of the network (number of convolution layers) (default 40)
-        growth_rate (int) - number of features added per DenseNet layer (default 12)
-        n_epochs (int) - number of epochs for training (default 300)
-        batch_size (int) - size of minibatch (default 256)
-        lr (float) - initial learning rate
-        wd (float) - weight decay
-        momentum (float) - momentum
-    """
-
-    if seed is not None:
-        torch.manual_seed(seed)
-
-    # Make save directory
-    if not os.path.exists(save):
-        os.makedirs(save)
-    if not os.path.isdir(save):
-        raise Exception('%s is not a dir' % save)
-
-    # Get densenet configuration
-    if (depth - 4) % 3:
-        raise Exception('Invalid depth')
-    block_config = [(depth - 4) // 6 for _ in range(3)]
-
-    # Data transforms
-    mean = [0.5071, 0.4867, 0.4408]
-    stdv = [0.2675, 0.2565, 0.2761]
-    train_transforms = tv.transforms.Compose([
-        tv.transforms.RandomCrop(32, padding=4),
-        tv.transforms.RandomHorizontalFlip(),
-        tv.transforms.ToTensor(),
-        tv.transforms.Normalize(mean=mean, std=stdv),
-    ])
-    test_transforms = tv.transforms.Compose([
-        tv.transforms.ToTensor(),
-        tv.transforms.Normalize(mean=mean, std=stdv),
-    ])
-
-    # Split training into train and validation - needed for calibration
-    #
-    # IMPORTANT! We need to use the same validation set for temperature
-    # scaling, so we're going to save the indices for later
-    train_set = tv.datasets.CIFAR100(data, train=True, transform=train_transforms, download=True)
-    valid_set = tv.datasets.CIFAR100(data, train=True, transform=test_transforms, download=False)
-    indices = torch.randperm(len(train_set))
-    train_indices = indices[:len(indices) - valid_size]
-    valid_indices = indices[len(indices) - valid_size:] if valid_size else None
-
-    # Make dataloaders
-    train_loader = torch.utils.data.DataLoader(train_set, pin_memory=True, batch_size=batch_size,
-                                               sampler=SubsetRandomSampler(train_indices))
-    valid_loader = torch.utils.data.DataLoader(valid_set, pin_memory=True, batch_size=batch_size,
-                                               sampler=SubsetRandomSampler(valid_indices))
-
-    # Make model, criterion, and optimizer
-    model = DenseNet(
-        growth_rate=growth_rate,
-        block_config=block_config,
-        num_classes=100
-    )
-    # Wrap model if multiple gpus
-    #if torch.cuda.device_count() > 1:
-    model_wrapper = torch.nn.DataParallel(model).cuda()
-    """ else:
-        model_wrapper = model.cuda() """
-    print(model_wrapper)
-
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(model_wrapper.parameters(), lr=lr, momentum=momentum, nesterov=True)
-    scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[0.5 * n_epochs, 0.75 * n_epochs], gamma=0.1)
-
-    # Train model
-    best_error = 1
-    for epoch in range(1, n_epochs + 1):
-        scheduler.step()
-        run_epoch(
-            loader=train_loader,
-            model=model_wrapper,
-            criterion=criterion,
-            optimizer=optimizer,
-            epoch=epoch,
-            n_epochs=n_epochs,
-            train=True,
-        )
-        valid_results = run_epoch(
-            loader=valid_loader,
-            model=model_wrapper,
-            criterion=criterion,
-            optimizer=optimizer,
-            epoch=epoch,
-            n_epochs=n_epochs,
-            train=False,
-        )
-
-        # Determine if model is the best
-        _, _, valid_error = valid_results
-        if valid_error[0] < best_error:
-            best_error = valid_error[0]
-            print('New best error: %.4f' % best_error)
-
-            # When we save the model, we're also going to
-            # include the validation indices
-            torch.save(model.state_dict(), os.path.join(save, 'model.pth'))
-            torch.save(valid_indices, os.path.join(save, 'valid_indices.pth'))
-
-    print('Done!')
+    res = []
+    for k in topk:
+        correct_k = correct[:k].view(-1).float().sum(0)
+        res.append(correct_k.mul_(100.0 / batch_size))
+    return res
 
 
-if __name__ == '__main__':
-    """
-    Train a 40-layer DenseNet-BC on CIFAR-100
+if __name__=='__main__':
+    main()
 
-    Args:
-        --data (str) - path to directory where data should be loaded from/downloaded
-            (default $DATA_DIR)
-        --save (str) - path to save the model to (default /tmp)
-
-        --valid_size (int) - size of validation set
-        --seed (int) - manually set the random seed (default None)
-    """
-    fire.Fire(train)

@@ -3,11 +3,15 @@ import os
 import torch
 import torchvision as tv
 from torch.utils.data.sampler import SubsetRandomSampler
-from models import DenseNet
+#from models import DenseNet
+#from models import DenseNet_Cifar
 from temperature_scaling import ModelWithTemperature
+from models import *
+import torch.nn as nn
 
 
-def demo(data, save, depth=40, growth_rate=12, batch_size=256):
+def demo(data, save, depth=40, growth_rate=40, batch_size=256):
+    torch.manual_seed(0)
     """
     Applies temperature scaling to a trained model.
 
@@ -24,13 +28,13 @@ def demo(data, save, depth=40, growth_rate=12, batch_size=256):
     save (str) - directory with necessary files (see above)
     """
     # Load model state dict
-    model_filename = os.path.join(save, 'model.pth')
+    model_filename = os.path.join(save, 'model_100.pth')
     if not os.path.exists(model_filename):
         raise RuntimeError('Cannot find file %s to load' % model_filename)
     state_dict = torch.load(model_filename)
 
     # Load validation indices
-    valid_indices_filename = os.path.join(save, 'valid_indices.pth')
+    valid_indices_filename = os.path.join(save, 'valid_indices_100.pth')
     if not os.path.exists(valid_indices_filename):
         raise RuntimeError('Cannot find file %s to load' % valid_indices_filename)
     valid_indices = torch.load(valid_indices_filename)
@@ -49,12 +53,11 @@ def demo(data, save, depth=40, growth_rate=12, batch_size=256):
     # Load original model
     if (depth - 4) % 3:
         raise Exception('Invalid depth')
-    block_config = [(depth - 4) // 6 for _ in range(3)]
-    orig_model = DenseNet(
-        growth_rate=growth_rate,
-        block_config=block_config,
-        num_classes=100
-    ).cuda()
+
+    #block_config = [(depth - 4) // 6 for _ in range(3)]
+    orig_model = densenet_BC_cifar(depth=40, k=40, num_classes=100).cuda()
+    orig_model = nn.DataParallel(orig_model)
+    #orig_model = densenet_BC_cifar(depth=40, k=40, num_classes=100)
     orig_model.load_state_dict(state_dict)
 
     # Now we're going to wrap the model with a decorator that adds temperature scaling
